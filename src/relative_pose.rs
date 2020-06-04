@@ -11,6 +11,8 @@ pub struct TwoViewOptimizer<I, T> {
     matches: I,
     pub pose: RelativeCameraPose,
     triangulator: T,
+    residuals: DVector<f64>,
+    jacobian: MatrixMN<f64, Dynamic, U6>,
 }
 
 impl<I, P, T> TwoViewOptimizer<I, T>
@@ -20,11 +22,61 @@ where
     T: TriangulatorRelative,
 {
     pub fn new(matches: I, pose: RelativeCameraPose, triangulator: T) -> Self {
+        let (residuals, jacobian) =
+            Self::compute_residuals_and_jacobian(matches.clone(), pose, &triangulator);
         Self {
             matches,
             pose,
             triangulator,
+            residuals,
+            jacobian,
         }
+    }
+
+    fn compute_residuals_and_jacobian(
+        matches: I,
+        pose: RelativeCameraPose,
+        triangulator: &T,
+    ) -> (DVector<f64>, MatrixMN<f64, Dynamic, U6>) {
+        // Initialize the jacobian with all zeros.
+        let residual_count = matches.clone().count() * 3;
+        let mut jacobian = MatrixMN::zeros_generic(Dynamic::new(residual_count), U6);
+        let mut residuals = DVector::zeros(residual_count);
+
+        // Loop through every match and row zipped together.
+        for (ix, FeatureMatch(a, b)) in matches.enumerate() {
+            let a = a.bearing();
+            let b = b.bearing();
+            let cam_a_point = if let Some(point) = triangulator.triangulate_relative(pose, a, b) {
+                point
+            } else {
+                continue;
+            };
+            let (cam_b_point, pose_jacobian_a_b) = pose.transform_jacobian_pose(cam_a_point);
+
+            // Get the point on the bearing `b` closest to the point.
+            let cam_b_p_hat = cam_b_point.coords.dot(&b) * b.into_inner();
+            let cam_a_p_hat = cam_a_point.coords.dot(&a) * a.into_inner();
+
+            // Compute the residual vector.
+            let residual_vector = cam_b_p_hat - cam_b_point.coords;
+
+            // The residual is the distance to the triangulated point from the projected point.
+            residuals[ix * 3] = residual_vector.x;
+            residuals[ix * 3 + 1] = residual_vector.y;
+            residuals[ix * 3 + 2] = residual_vector.z;
+            jacobian
+                .row_mut(ix * 3)
+                .copy_from(&(pose_jacobian_a_b * -Vector3::x()).transpose());
+            jacobian
+                .row_mut(ix * 3 + 1)
+                .copy_from(&(pose_jacobian_a_b * -Vector3::y()).transpose());
+            jacobian
+                .row_mut(ix * 3 + 2)
+                .copy_from(&(pose_jacobian_a_b * -Vector3::z()).transpose());
+        }
+
+        (residuals, jacobian)
     }
 }
 
@@ -45,6 +97,20 @@ where
         self.pose.translation.vector = x.xyz();
         let x = x.as_slice();
         self.pose.rotation = Skew3(Vector3::new(x[3], x[4], x[5])).into();
+
+        // Clear out the old residuals and jacobian first to reduce maximum memory consumption.
+        self.residuals = DVector::zeros(0);
+        self.jacobian = MatrixMN::zeros_generic(Dynamic::new(0), U6);
+
+        // Compute the new residuals and jacobian.
+        let (residuals, jacobian) = Self::compute_residuals_and_jacobian(
+            self.matches.clone(),
+            self.pose,
+            &self.triangulator,
+        );
+
+        self.residuals = residuals;
+        self.jacobian = jacobian;
     }
 
     /// Get the stored parameters `$\vec{x}$`.
@@ -59,60 +125,17 @@ where
 
     /// Compute the residual vector.
     fn residuals(&self) -> Option<DVector<f64>> {
-        Some(DVector::from_iterator(
-            self.matches.clone().count(),
-            self.matches.clone().map(|FeatureMatch(a, b)| {
-                let a = a.bearing();
-                let b = b.bearing();
-                self.triangulator
-                    .triangulate_relative(self.pose, a, b)
-                    .map(|point| {
-                        let a_hat = point.coords.normalize();
-                        let b_hat = self.pose.transform(point).coords.normalize();
-
-                        1.0 - a.dot(&a_hat) + 1.0 - b.dot(&b_hat)
-                    })
-                    .unwrap_or(0.0)
-            }),
-        ))
+        Some(self.residuals.clone())
     }
 
-    /// Compute the Jacobian of the residual vector.
-    fn jacobian(&self) -> Option<MatrixMN<f64, Dynamic, U6>> {
-        let mut clone = self.clone();
-        differentiate_numerically(&mut clone)
-    }
-
-    // /// Compute the Jacobian of the pose.
+    // /// Compute the Jacobian of the residual vector.
     // fn jacobian(&self) -> Option<MatrixMN<f64, Dynamic, U6>> {
-    //     // Initialize the jacobian with all zeros.
-    //     let mut jacobian = MatrixMN::zeros_generic(Dynamic::new(self.matches.clone().count()), U6);
-
-    //     // Loop through every match and row zipped together.
-    //     for (mut row, FeatureMatch(a, b)) in jacobian.row_iter_mut().zip(self.matches.clone()) {
-    //         let a = a.bearing();
-    //         let b = b.bearing();
-    //         let point = if let Some(point) = self.triangulator.triangulate_relative(self.pose, a, b)
-    //         {
-    //             point
-    //         } else {
-    //             continue;
-    //         };
-    //         let (cam_b_point, pose_jacobian) = self.pose.transform_jacobian_pose(point);
-    //         let b_hat = Unit::new_normalize(cam_b_point.coords);
-    //         let a_hat = Unit::new_normalize(point.coords);
-
-    //         // Compute an approximate partial derivative.
-    //         let d_res_b = b.into_inner() - b_hat.into_inner();
-    //         let d_res_a = self
-    //             .pose
-    //             .transform_vector(&(a.into_inner() - a_hat.into_inner()));
-
-    //         // Convert that into pose deltas.
-    //         let pose_delta = pose_jacobian * (d_res_b + d_res_a);
-    //         row.copy_from(&pose_delta.transpose());
-    //     }
-
-    //     Some(jacobian)
+    //     let mut clone = self.clone();
+    //     differentiate_numerically(&mut clone)
     // }
+
+    /// Compute the Jacobian of the pose.
+    fn jacobian(&self) -> Option<MatrixMN<f64, Dynamic, U6>> {
+        Some(self.jacobian.clone())
+    }
 }
